@@ -54,6 +54,10 @@ class PostureGaitAnalyzer:
         self.right_steps = 0
         self.prev_left_dir = 0
         self.prev_right_dir = 0
+        self.last_left_step_frame = 0  # или 0, если нужно
+        self.last_right_step_frame = 0
+        self.min_frames_between_steps = 10  # или другое значение
+        self.min_step_amplitude = 5.0       # для вертикального паттерна
         
         # Для определения завершения шага
         self.step_phase = "none"
@@ -76,7 +80,12 @@ class PostureGaitAnalyzer:
             'step_asymmetry': [],
             'pelvic_shoulder_rotation': [],
             'center_of_gravity_deviation': [],
-            'arm_movement_symmetry': []
+            'arm_movement_symmetry': [],
+            'knee_deviation_left':[],
+            'knee_deviation_right':[],
+            'neck':[],
+            'trunk_rotation':[]
+
         }
         
         # Для хранения метрик между шагами
@@ -102,6 +111,306 @@ class PostureGaitAnalyzer:
         keypoints_data = results.keypoints[0].cpu().numpy()  # Get first person's keypoints
         
         return keypoints_data
+    
+    def analyze_frame_front(self, keypoints, frame, frame_idx):
+        """Анализ осанки и походки на основе ключевых точек"""
+        metrics = {}
+
+        if isinstance(keypoints, Keypoints):
+            keypoints = keypoints.data
+
+        # Проверяем, является ли keypoints объектом Keypoints
+        if isinstance(keypoints, torch.Tensor):  
+            keypoints = keypoints.data.cpu().numpy()  # Преобразуем в numpy массив
+
+        # Если keypoints уже является numpy массивом — ничего не делаем
+        elif isinstance(keypoints, np.ndarray):
+            pass  # Оставляем без изменений
+
+        else:
+            print(f"Ошибка: keypoints имеет неверный тип ({type(keypoints)})")
+            return None, frame
+        
+        if keypoints.ndim == 3 and keypoints.shape[0] == 1:
+            keypoints = np.squeeze(keypoints)  # (1, 17, 3)
+
+        #  keypoints имеет хотя бы 3 столбца (x, y, confidence)
+        if keypoints.ndim != 2 or keypoints.shape[1] < 3:
+            print(f"Ошибка: keypoints имеет неверную форму {keypoints.shape}")
+            return None, frame
+    
+        # Проверяем, что keypoints имеет правильную форму (2D массив с >=3 колонками)
+        if keypoints.ndim != 2 or keypoints.shape[1] < 3:
+            print(f"Ошибка: keypoints имеет неверную форму {keypoints.shape}")
+            return None, frame
+
+        # Проверяем уверенность предсказанных точек
+        kp_coords = {}
+        for name, idx in self.keypoints_mapping.items():
+            if idx < len(keypoints):  # Проверяем, что индекс в пределах массива
+                x, y, conf = keypoints[idx]
+                if conf > 0.5:  #  Используем только уверенные точки
+                    kp_coords[name] = (int(x), int(y))
+                else:
+                    kp_coords[name] = None  # Пропускаем неуверенные точки
+
+        # Проверяем, есть ли вообще какие-то хорошие точки
+        if all(v is None for v in kp_coords.values()):
+            print("Все точки имеют низкую уверенность, пропускаем кадр")
+            return None, frame
+
+        # Получение координат ключевых точек
+        kp_coords = {}
+        for name, idx in self.keypoints_mapping.items():
+            if idx < len(keypoints):  # Проверка, что индекс в пределах массива
+                x, y, conf = keypoints[idx]
+                kp_coords[name] = (int(x), int(y)) if conf > 0.5 else None
+
+        # Рисуем ключевые точки
+        for name, pos in kp_coords.items():
+            if pos:
+                cv2.circle(frame, pos, 3, (0, 255, 0), -1)
+        
+        # Отрисовка соединений между ключевыми точками
+        connections = [
+            ('left_shoulder', 'right_shoulder'), ('left_shoulder', 'left_elbow'),
+            ('right_shoulder', 'right_elbow'), ('left_elbow', 'left_wrist'),
+            ('right_elbow', 'right_wrist'), ('left_shoulder', 'left_hip'),
+            ('right_shoulder', 'right_hip'), ('left_hip', 'right_hip'),
+            ('left_hip', 'left_knee'), ('right_hip', 'right_knee'),
+            ('left_knee', 'left_ankle'), ('right_knee', 'right_ankle')
+        ]
+        
+        for conn in connections:
+            if kp_coords[conn[0]] and kp_coords[conn[1]]:
+                cv2.line(frame, kp_coords[conn[0]], kp_coords[conn[1]], (0, 255, 255), 2)
+        
+        # 1. Разница в длине ног
+        if all(kp_coords[k] for k in ['left_hip', 'left_ankle', 'right_hip', 'right_ankle']):
+            left_leg_length = abs(kp_coords['left_hip'][1] - kp_coords['left_ankle'][1])
+            right_leg_length = abs(kp_coords['right_hip'][1] - kp_coords['right_ankle'][1])
+            leg_length_diff = abs(left_leg_length - right_leg_length)
+            metrics['leg_length_diff'] = leg_length_diff
+            self.metrics_history['leg_length_diff'].append(leg_length_diff)
+            self.current_step_metrics['leg_length_diff'].append(leg_length_diff)
+            
+            # Отображение на кадре
+            cv2.putText(frame, f"Leg Length Diff: {leg_length_diff:.2f}px", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 2. Высота плеч (асимметрия)
+        if kp_coords['left_shoulder'] and kp_coords['right_shoulder']:
+            shoulder_height_diff = abs(kp_coords['left_shoulder'][1] - kp_coords['right_shoulder'][1])
+            metrics['shoulder_height_diff'] = shoulder_height_diff
+            self.metrics_history['shoulder_height_diff'].append(shoulder_height_diff)
+            self.current_step_metrics['shoulder_height_diff'].append(shoulder_height_diff)
+            
+            cv2.putText(frame, f"Shoulder Height Diff: {shoulder_height_diff:.2f}px", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 3. Наклон таза
+        if kp_coords['left_hip'] and kp_coords['right_hip']:
+            dx = kp_coords['right_hip'][0] - kp_coords['left_hip'][0]
+            dy = kp_coords['right_hip'][1] - kp_coords['left_hip'][1]
+            pelvic_tilt = abs(math.degrees(math.atan2(dy, dx)))
+            # Угол от горизонтали (0° - идеально ровный таз)
+            pelvic_tilt = 90 - pelvic_tilt if pelvic_tilt > 90 else pelvic_tilt
+            
+            metrics['pelvic_tilt'] = pelvic_tilt
+            self.metrics_history['pelvic_tilt'].append(pelvic_tilt)
+            self.current_step_metrics['pelvic_tilt'].append(pelvic_tilt)
+            
+            cv2.putText(frame, f"Pelvic Tilt: {pelvic_tilt:.2f} deg", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 4. Наклон плеч
+        if kp_coords['left_shoulder'] and kp_coords['right_shoulder']:
+            dx = kp_coords['right_shoulder'][0] - kp_coords['left_shoulder'][0]
+            dy = kp_coords['right_shoulder'][1] - kp_coords['left_shoulder'][1]
+            shoulder_tilt = abs(math.degrees(math.atan2(dy, dx)))
+            # Угол от горизонтали (0° - идеально ровные плечи)
+            shoulder_tilt = 90 - shoulder_tilt if shoulder_tilt > 90 else shoulder_tilt
+            
+            metrics['shoulder_tilt'] = shoulder_tilt
+            self.metrics_history['shoulder_tilt'].append(shoulder_tilt)
+            self.current_step_metrics['shoulder_tilt'].append(shoulder_tilt)
+            
+            cv2.putText(frame, f"Shoulder Tilt: {shoulder_tilt:.2f} deg", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 5. Вальгус/варус коленей
+        if all(kp_coords[k] for k in ['left_hip', 'left_knee', 'left_ankle']):
+            # Для левого колена
+            # Вычисляем медиальное/латеральное отклонение колена от прямой линии между бедром и лодыжкой
+            hip_to_ankle_vector = [kp_coords['left_ankle'][0] - kp_coords['left_hip'][0], 
+                                kp_coords['left_ankle'][1] - kp_coords['left_hip'][1]]
+            
+            # Находим точку на линии бедро-лодыжка, которая находится на той же высоте, что и колено
+            t = (kp_coords['left_knee'][1] - kp_coords['left_hip'][1]) / hip_to_ankle_vector[1] if hip_to_ankle_vector[1] != 0 else 0
+            expected_knee_x = kp_coords['left_hip'][0] + t * hip_to_ankle_vector[0]
+            
+            # Медиальное/латеральное отклонение (отрицательное - valgus, положительное - varus)
+            knee_deviation_left = kp_coords['left_knee'][0] - expected_knee_x
+            
+            metrics['knee_deviation_left'] = knee_deviation_left
+            self.metrics_history['knee_deviation_left'].append(knee_deviation_left)
+            self.current_step_metrics['knee_deviation_left'].append(knee_deviation_left)
+            
+            deviation_type = "Valgus" if knee_deviation_left < 0 else "Varus"
+            cv2.putText(frame, f"Left Knee {deviation_type}: {abs(knee_deviation_left):.2f}px", (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        if all(kp_coords[k] for k in ['right_hip', 'right_knee', 'right_ankle']):
+            # Для правого колена
+            hip_to_ankle_vector = [kp_coords['right_ankle'][0] - kp_coords['right_hip'][0], 
+                                kp_coords['right_ankle'][1] - kp_coords['right_hip'][1]]
+            
+            t = (kp_coords['right_knee'][1] - kp_coords['right_hip'][1]) / hip_to_ankle_vector[1] if hip_to_ankle_vector[1] != 0 else 0
+            expected_knee_x = kp_coords['right_hip'][0] + t * hip_to_ankle_vector[0]
+            
+            # Для правого колена отклонение интерпретируется противоположно левому
+            knee_deviation_right = expected_knee_x - kp_coords['right_knee'][0]
+            
+            metrics['knee_deviation_right'] = knee_deviation_right
+            self.metrics_history['knee_deviation_right'].append(knee_deviation_right)
+            self.current_step_metrics['knee_deviation_right'].append(knee_deviation_right)
+            
+            deviation_type = "Valgus" if knee_deviation_right < 0 else "Varus"
+            cv2.putText(frame, f"Right Knee {deviation_type}: {abs(knee_deviation_right):.2f}px", (10, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Сохранение позиций лодыжек для анализа походки
+        if kp_coords['left_ankle']:
+            self.left_ankle_pos.append((kp_coords['left_ankle'], frame_idx))
+        
+        if kp_coords['right_ankle']:
+            self.right_ankle_pos.append((kp_coords['right_ankle'], frame_idx))
+        
+        # Сохранение позиций запястий для анализа симметрии движения рук
+        if kp_coords['left_wrist']:
+            self.left_wrist_pos.append(kp_coords['left_wrist'])
+        
+        if kp_coords['right_wrist']:
+            self.right_wrist_pos.append(kp_coords['right_wrist'])
+        
+        # 6. Ширина шага
+        if kp_coords['left_ankle'] and kp_coords['right_ankle']:
+            step_width = abs(kp_coords['left_ankle'][0] - kp_coords['right_ankle'][0])
+            metrics['step_width'] = step_width
+            self.metrics_history['step_width'].append(step_width)
+            self.current_step_metrics['step_width'].append(step_width)
+        
+        # 7. Асимметрия шага
+        if len(self.left_ankle_pos) > 5 and len(self.right_ankle_pos) > 5:
+            left_stride = self.calculate_stride([pos for pos, _ in self.left_ankle_pos])
+            right_stride = self.calculate_stride([pos for pos, _ in self.right_ankle_pos])
+            
+            if left_stride and right_stride:
+                step_asymmetry = abs(left_stride - right_stride)
+                metrics['step_asymmetry'] = step_asymmetry
+                self.metrics_history['step_asymmetry'].append(step_asymmetry)
+                self.current_step_metrics['step_asymmetry'].append(step_asymmetry)
+                
+                cv2.putText(frame, f"Step Asymmetry: {step_asymmetry:.2f}px", (10, 240),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 8. Ротация таза и плеч
+        if all(kp_coords[k] for k in ['left_shoulder', 'right_shoulder', 'left_hip', 'right_hip']):
+            shoulder_angle = math.degrees(math.atan2(
+                kp_coords['right_shoulder'][1] - kp_coords['left_shoulder'][1],
+                kp_coords['right_shoulder'][0] - kp_coords['left_shoulder'][0]
+            ))
+            
+            hip_angle = math.degrees(math.atan2(
+                kp_coords['right_hip'][1] - kp_coords['left_hip'][1],
+                kp_coords['right_hip'][0] - kp_coords['left_hip'][0]
+            ))
+            
+            # Угол ротации туловища во фронтальной плоскости
+            trunk_rotation = abs(shoulder_angle - hip_angle)
+            if trunk_rotation > 180:
+                trunk_rotation = 360 - trunk_rotation
+            
+            metrics['trunk_rotation'] = trunk_rotation
+            self.metrics_history['trunk_rotation'].append(trunk_rotation)
+            self.current_step_metrics['trunk_rotation'].append(trunk_rotation)
+            
+            cv2.putText(frame, f"Trunk Rotation: {trunk_rotation:.2f} deg", (10, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 9. Отклонение центра тяжести
+        if all(kp_coords[k] for k in ['left_hip', 'right_hip', 'left_shoulder', 'right_shoulder']):
+            # Примерное вычисление центра тяжести как среднего между плечами и бедрами
+            center_x = (kp_coords['left_shoulder'][0] + kp_coords['right_shoulder'][0] + 
+                       kp_coords['left_hip'][0] + kp_coords['right_hip'][0]) / 4
+            
+            # Центральная линия (ось) тела
+            mid_shoulder_x = (kp_coords['left_shoulder'][0] + kp_coords['right_shoulder'][0]) / 2
+            mid_hip_x = (kp_coords['left_hip'][0] + kp_coords['right_hip'][0]) / 2
+            
+            # Отклонение от оси
+            deviation = abs(center_x - (mid_shoulder_x + mid_hip_x) / 2)
+            metrics['center_of_gravity_deviation'] = deviation
+            self.metrics_history['center_of_gravity_deviation'].append(deviation)
+            self.current_step_metrics['center_of_gravity_deviation'].append(deviation)
+            
+            cv2.putText(frame, f"COG Deviation: {deviation:.2f}px", (10, 300),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # Отрисовка центра тяжести и оси
+            cog_pos = (int(center_x), int((kp_coords['left_hip'][1] + kp_coords['right_hip'][1]) / 2))
+            cv2.circle(frame, cog_pos, 5, (255, 0, 0), -1)
+            
+            # Вертикальная ось тела
+            mid_shoulder = (int(mid_shoulder_x), int((kp_coords['left_shoulder'][1] + kp_coords['right_shoulder'][1]) / 2))
+            mid_hip = (int(mid_hip_x), int((kp_coords['left_hip'][1] + kp_coords['right_hip'][1]) / 2))
+            cv2.line(frame, mid_shoulder, mid_hip, (255, 255, 0), 2)
+            
+            # Продолжение оси вниз
+            bottom_y = self.frame_height
+            axis_dir = (mid_hip[0] - mid_shoulder[0], mid_hip[1] - mid_shoulder[1])
+            if axis_dir[1] != 0:
+                t = (bottom_y - mid_hip[1]) / axis_dir[1]
+                bottom_x = int(mid_hip[0] + t * axis_dir[0])
+                cv2.line(frame, mid_hip, (bottom_x, bottom_y), (255, 255, 0), 2)
+
+        
+        # 10. Симметрия движения рук
+        if len(self.left_wrist_pos) > 5 and len(self.right_wrist_pos) > 5:
+            left_arm_movement = self.calculate_vertical_movement(self.left_wrist_pos)
+            right_arm_movement = self.calculate_vertical_movement(self.right_wrist_pos)
+            
+            if left_arm_movement is not None and right_arm_movement is not None:
+                arm_asymmetry = abs(left_arm_movement - right_arm_movement)
+                metrics['arm_movement_symmetry'] = arm_asymmetry
+                self.metrics_history['arm_movement_symmetry'].append(arm_asymmetry)
+                self.current_step_metrics['arm_movement_symmetry'].append(arm_asymmetry)
+                
+                cv2.putText(frame, f"Arm Asym: {arm_asymmetry:.2f}px", (10, 330),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 11. Подсчет шагов и обработка фаз шага
+        prev_left_steps = self.left_steps
+        prev_right_steps = self.right_steps
+
+        # Модифицированная функция обнаружения шагов для фронтальной проекции
+        self.detect_steps_frontal(frame_idx)
+
+        total_steps = self.left_steps + self.right_steps
+        cv2.putText(frame, f"Steps: {total_steps}", (10, 360),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # Если обнаружен новый шаг, выполняем усреднение метрик и сохранение
+        if self.left_steps > prev_left_steps or self.right_steps > prev_right_steps:
+            self.process_step_completed()
+
+        # Отображение последних метрик шага, если они есть
+        if self.step_averages:
+            last_avg = self.step_averages[-1]
+            cv2.putText(frame, f"Last Step: W-Asym={last_avg.get('weight_asymmetry', 0):.2f}%", (10, 390),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+        return metrics, frame
     
     def analyze_frame(self, keypoints, frame, frame_idx):
         """Анализ осанки и походки на основе ключевых точек"""
@@ -367,7 +676,7 @@ class PostureGaitAnalyzer:
         prev_left_steps = self.left_steps
         prev_right_steps = self.right_steps
         
-        self.detect_and_process_steps(frame_idx)
+        self.detect_steps_frontal(frame_idx)
         
         total_steps = self.left_steps + self.right_steps
         cv2.putText(frame, f"Steps: {total_steps}", (10, 360),
@@ -385,39 +694,214 @@ class PostureGaitAnalyzer:
         
         return metrics, frame
     
-    def detect_and_process_steps(self, frame_idx):
-        """Обнаружение шагов и обработка фаз шага"""
-        if len(self.left_ankle_pos) < 3 or len(self.right_ankle_pos) < 3:
+    # def detect_and_process_steps(self, frame_idx):
+    #     """Обнаружение шагов и обработка фаз шага"""
+    #     if len(self.left_ankle_pos) < 3 or len(self.right_ankle_pos) < 3:
+    #         return
+        
+    #     # Для левой ноги
+    #     left_positions = [(pos, idx) for pos, idx in self.left_ankle_pos]
+    #     if len(left_positions) >= 3:
+    #         # Определяем направление движения
+    #         current_dir = 1 if left_positions[-1][0][0] > left_positions[-2][0][0] else -1
+            
+    #         # Если направление изменилось, считаем это шагом
+    #         if current_dir != self.prev_left_dir and self.prev_left_dir != 0:
+    #             self.left_steps += 1
+    #             self.left_step_start = True
+    #             # Сохраняем индекс кадра начала шага
+    #             self.step_start_idx = frame_idx
+            
+    #         self.prev_left_dir = current_dir
+        
+    #     # Для правой ноги
+    #     right_positions = [(pos, idx) for pos, idx in self.right_ankle_pos]
+    #     if len(right_positions) >= 3:
+    #         current_dir = 1 if right_positions[-1][0][0] > right_positions[-2][0][0] else -1
+            
+    #         if current_dir != self.prev_right_dir and self.prev_right_dir != 0:
+    #             self.right_steps += 1
+    #             self.right_step_start = True
+    #             # Сохраняем индекс кадра начала шага
+    #             self.step_start_idx = frame_idx
+            
+    #         self.prev_right_dir = current_dir
+    
+    def detect_steps_frontal(self, frame_idx):
+        """
+        Обнаружение шагов при анализе фронтальной проекции (вид спереди/сзади).
+        Использует комбинацию нескольких признаков для надежного определения шагов.
+        
+        Args:
+            frame_idx (int): Индекс текущего кадра
+        """
+        # Проверяем, достаточно ли данных для анализа
+        if len(self.left_ankle_pos) < 5 or len(self.right_ankle_pos) < 5:
             return
         
-        # Для левой ноги
-        left_positions = [(pos, idx) for pos, idx in self.left_ankle_pos]
-        if len(left_positions) >= 3:
-            # Определяем направление движения
-            current_dir = 1 if left_positions[-1][0][0] > left_positions[-2][0][0] else -1
-            
-            # Если направление изменилось, считаем это шагом
-            if current_dir != self.prev_left_dir and self.prev_left_dir != 0:
-                self.left_steps += 1
-                self.left_step_start = True
-                # Сохраняем индекс кадра начала шага
-                self.step_start_idx = frame_idx
-            
-            self.prev_left_dir = current_dir
+        # Получаем последние позиции лодыжек (за последние ~1 секунду)
+        max_history = 15  # Примерно 0.5 секунды при 30 fps
+        recent_left_ankles = list(self.left_ankle_pos)[-max_history:]
+        recent_right_ankles = list(self.right_ankle_pos)[-max_history:]
         
-        # Для правой ноги
-        right_positions = [(pos, idx) for pos, idx in self.right_ankle_pos]
-        if len(right_positions) >= 3:
-            current_dir = 1 if right_positions[-1][0][0] > right_positions[-2][0][0] else -1
+        # Извлекаем координаты X и Y для обеих лодыжек
+        left_x = [pos[0] for pos, _ in recent_left_ankles]
+        left_y = [pos[1] for pos, _ in recent_left_ankles]
+        right_x = [pos[0] for pos, _ in recent_right_ankles]
+        right_y = [pos[1] for pos, _ in recent_right_ankles]
+        
+        # Вычисляем расстояние между лодыжками для каждого кадра
+        ankle_distances = []
+        frame_indices = []
+        
+        # Синхронизируем данные по временным меткам кадров
+        left_frames = [fidx for _, fidx in recent_left_ankles]
+        right_frames = [fidx for _, fidx in recent_right_ankles]
+        
+        common_frames = set(left_frames).intersection(set(right_frames))
+        
+        for frame in common_frames:
+            left_idx = left_frames.index(frame)
+            right_idx = right_frames.index(frame)
             
-            if current_dir != self.prev_right_dir and self.prev_right_dir != 0:
-                self.right_steps += 1
-                self.right_step_start = True
-                # Сохраняем индекс кадра начала шага
-                self.step_start_idx = frame_idx
+            left_pos = recent_left_ankles[left_idx][0]
+            right_pos = recent_right_ankles[right_idx][0]
             
-            self.prev_right_dir = current_dir
-    
+            # Расстояние между лодыжками
+            distance = math.sqrt((left_pos[0] - right_pos[0])**2 + (left_pos[1] - right_pos[1])**2)
+            ankle_distances.append(distance)
+            frame_indices.append(frame)
+        
+        # Если недостаточно данных, пропускаем
+        if len(ankle_distances) < 5:
+            return
+        
+        # 1. Обнаружение шага левой ногой
+        # Шаг левой ногой характеризуется:
+        # - Увеличением расстояния между лодыжками
+        # - Движением левой лодыжки вперед (уменьшение X при виде спереди)
+        # - Временным снижением высоты левой лодыжки с последующим подъемом
+        
+        # Проверяем изменение расстояния между лодыжками
+        for i in range(2, len(ankle_distances) - 2):
+            # Проверяем, было ли локальное максимальное расстояние между лодыжками
+            is_distance_peak = (ankle_distances[i] > ankle_distances[i-1] and 
+                            ankle_distances[i] > ankle_distances[i-2] and
+                            ankle_distances[i] > ankle_distances[i+1] and
+                            ankle_distances[i] > ankle_distances[i+2])
+            
+            if not is_distance_peak:
+                continue
+            
+            # Находим соответствующие индексы в массивах позиций лодыжек
+            try:
+                left_idx = left_frames.index(frame_indices[i])
+                
+                # Проверяем, был ли недавно зарегистрирован шаг
+                if frame_idx - self.last_left_step_frame < self.min_frames_between_steps:
+                    continue
+                
+                # Проверяем движение левой лодыжки по координате X
+                # При виде спереди движение вперед - это уменьшение X
+                if left_idx > 1 and left_x[left_idx] < left_x[left_idx-2]:
+                    # Проверяем изменение высоты (координата Y)
+                    # Шаговый паттерн: небольшое опускание с последующим подъемом
+                    is_y_pattern = False
+                    
+                    if left_idx > 2 and left_idx < len(left_y) - 2:
+                        # Проверяем наличие опускания и подъема
+                        down_phase = left_y[left_idx] > left_y[left_idx-2]  # Y увеличивается = опускание
+                        up_phase = left_y[left_idx+1] < left_y[left_idx]   # Y уменьшается = подъем
+                        is_y_pattern = down_phase and up_phase
+                    
+                    if is_y_pattern:
+                        self.left_steps += 1
+                        self.last_left_step_frame = frame_idx
+                        
+                        # Сохраняем параметры шага для анализа
+                        if hasattr(self, 'step_parameters'):
+                            self.step_parameters.append({
+                                'side': 'left',
+                                'frame': frame_idx,
+                                'ankle_position': recent_left_ankles[left_idx][0]
+                            })
+            except ValueError:
+                continue
+        
+        # 2. Обнаружение шага правой ногой
+        # Аналогичная логика для правой ноги
+        for i in range(2, len(ankle_distances) - 2):
+            is_distance_peak = (ankle_distances[i] > ankle_distances[i-1] and 
+                            ankle_distances[i] > ankle_distances[i-2] and
+                            ankle_distances[i] > ankle_distances[i+1] and
+                            ankle_distances[i] > ankle_distances[i+2])
+            
+            if not is_distance_peak:
+                continue
+            
+            try:
+                right_idx = right_frames.index(frame_indices[i])
+                
+                if frame_idx - self.last_right_step_frame < self.min_frames_between_steps:
+                    continue
+                
+                # При виде спереди движение вперед - это увеличение X для правой ноги
+                if right_idx > 1 and right_x[right_idx] > right_x[right_idx-2]:
+                    is_y_pattern = False
+                    
+                    if right_idx > 2 and right_idx < len(right_y) - 2:
+                        down_phase = right_y[right_idx] > right_y[right_idx-2]
+                        up_phase = right_y[right_idx+1] < right_y[right_idx]
+                        is_y_pattern = down_phase and up_phase
+                    
+                    if is_y_pattern:
+                        self.right_steps += 1
+                        self.last_right_step_frame = frame_idx
+                        
+                        if hasattr(self, 'step_parameters'):
+                            self.step_parameters.append({
+                                'side': 'right',
+                                'frame': frame_idx,
+                                'ankle_position': recent_right_ankles[right_idx][0]
+                            })
+            except ValueError:
+                continue
+        
+        # 3. Альтернативный метод: определение шагов на основе вертикальных колебаний
+        # Используется если основной метод не обнаружил шаги
+        if frame_idx - self.last_left_step_frame > 3 * self.min_frames_between_steps and len(left_y) > 5:
+            # Ищем локальные минимумы в вертикальной позиции (верхнее положение лодыжки)
+            for i in range(2, len(left_y) - 2):
+                # При виде спереди подъем ноги = уменьшение Y
+                if (left_y[i] < left_y[i-1] and left_y[i] < left_y[i-2] and 
+                    left_y[i] < left_y[i+1] and left_y[i] < left_y[i+2]):
+                    
+                    # Проверяем, был ли недавно шаг
+                    if frame_idx - self.last_left_step_frame < self.min_frames_between_steps:
+                        continue
+                    
+                    # Вертикальная амплитуда должна быть достаточной для шага
+                    amplitude = max(left_y[i-2:i+3]) - min(left_y[i-2:i+3])
+                    if amplitude > self.min_step_amplitude:
+                        self.left_steps += 1
+                        self.last_left_step_frame = frame_idx
+                        break
+        
+        # То же для правой ноги
+        if frame_idx - self.last_right_step_frame > 3 * self.min_frames_between_steps and len(right_y) > 5:
+            for i in range(2, len(right_y) - 2):
+                if (right_y[i] < right_y[i-1] and right_y[i] < right_y[i-2] and 
+                    right_y[i] < right_y[i+1] and right_y[i] < right_y[i+2]):
+                    
+                    if frame_idx - self.last_right_step_frame < self.min_frames_between_steps:
+                        continue
+                    
+                    amplitude = max(right_y[i-2:i+3]) - min(right_y[i-2:i+3])
+                    if amplitude > self.min_step_amplitude:
+                        self.right_steps += 1
+                        self.last_right_step_frame = frame_idx
+                        break
+
     def process_step_completed(self):
         """Обработка завершения шага и усреднение метрик"""
         # Усредняем метрики текущего шага
@@ -457,7 +941,7 @@ class PostureGaitAnalyzer:
         y_values = [pos[1] for pos in pos_history]
         return max(y_values) - min(y_values)
     
-    def analyze_video(self, output_path=None, json_path=None):
+    def analyze_video(self, output_path=None, json_path=None, type=None):
         """Анализ видео и сохранение результатов"""
         if output_path:
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -472,7 +956,10 @@ class PostureGaitAnalyzer:
                 break
             
             keypoints = self.detect_keypoints(frame)
-            metrics, processed_frame = self.analyze_frame(keypoints, frame, frame_idx)
+            if type == "sag":
+                metrics, processed_frame = self.analyze_frame(keypoints, frame, frame_idx)
+            else:
+                metrics, processed_frame = self.analyze_frame_front(keypoints, frame, frame_idx)
             frame_idx += 1
             
             if metrics:
@@ -761,7 +1248,8 @@ def main():
     parser.add_argument('--json', type=str, default=None, help='Путь для сохранения результатов в JSON')
     parser.add_argument('--report', type=str, default=None, help='Путь для сохранения текстового отчета')
     parser.add_argument('--visualize', type=str, default=None, help='Директория для сохранения графиков')
-    parser.add_argument('--model', type=str, default=None, help='Путь к модели YOLOv8 (опционально)')
+    parser.add_argument('--model', type=str, default=None, help='Путь к модели YOLOv11 (опционально)')
+    parser.add_argument('--view', type=str, choices=['fr', 'sag'], default='fr', help='fr/sag')
     
     args = parser.parse_args()
     
@@ -775,7 +1263,8 @@ def main():
     
     # Анализ видео
     print(f"Анализ видео: {args.video}")
-    report = analyzer.analyze_video(args.output, args.json)
+    report = analyzer.analyze_video(args.output, args.json, type=args.view)
+
     
     # Визуализация метрик
     if args.visualize:
