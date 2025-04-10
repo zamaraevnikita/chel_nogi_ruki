@@ -1181,50 +1181,7 @@ class PostureGaitAnalyzer:
                 summary.append(f"  Максимум: {report[metric]['max']:.2f}")
                 summary.append(f"  Медиана: {report[metric]['median']:.2f}\n")
         
-        # Рекомендации
-        summary.append("== РЕКОМЕНДАЦИИ ==")
-        
-        # Логика для рекомендаций на основе метрик
-        recommendations = []
-        
-        # Анализ осанки
-        if 'shoulder_height_diff' in report and report['shoulder_height_diff']['mean'] > 10:
-            recommendations.append("- Наблюдается асимметрия плеч. Рекомендуются упражнения для укрепления мышц спины и растяжки.")
-        
-        if 'pelvic_tilt' in report and abs(report['pelvic_tilt']['mean']) > 5:
-            if report['pelvic_tilt']['mean'] > 0:
-                recommendations.append("- Присутствует передний наклон таза. Рекомендуются упражнения для укрепления брюшных мышц и растяжки сгибателей бедра.")
-            else:
-                recommendations.append("- Присутствует задний наклон таза. Рекомендуются упражнения для укрепления мышц нижней части спины и растяжки подколенных сухожилий.")
-        
-        if 'shoulder_tilt' in report and abs(report['shoulder_tilt']['mean']) > 5:
-            recommendations.append("- Наблюдается наклон плеч. Рекомендуются упражнения для улучшения осанки и баланса мышц.")
-        
-        # Анализ походки
-        if 'step_asymmetry' in report and report['step_asymmetry']['mean'] > 20:
-            recommendations.append("- Значительная асимметрия шага. Рекомендуется консультация специалиста и упражнения для улучшения равномерности походки.")
-        
-        if 'gait_symmetry' in report and report['gait_symmetry'] < 0.8:
-            recommendations.append("- Неравномерное распределение шагов между левой и правой ногой. Рекомендуются тренировки баланса и равномерности ходьбы.")
-        
-        if 'knee_valgus_varus_left' in report and report['knee_valgus_varus_left']['mean'] > 10:
-            recommendations.append("- Наблюдается вальгус/варус левого колена. Рекомендуются укрепляющие упражнения для мышц бедра и растяжки.")
-        
-        if 'knee_valgus_varus_right' in report and report['knee_valgus_varus_right']['mean'] > 10:
-            recommendations.append("- Наблюдается вальгус/варус правого колена. Рекомендуются укрепляющие упражнения для мышц бедра и растяжки.")
-        
-        if 'center_of_gravity_deviation' in report and report['center_of_gravity_deviation']['mean'] > 15:
-            recommendations.append("- Значительное отклонение центра тяжести. Рекомендуются упражнения для улучшения баланса и равномерной нагрузки на ноги.")
-        
-        if 'arm_movement_symmetry' in report and report['arm_movement_symmetry']['mean'] > 20:
-            recommendations.append("- Асимметрия движения рук при ходьбе. Рекомендуются упражнения для улучшения координации движений верхних конечностей.")
-        
-        # Если серьезных проблем не обнаружено
-        if not recommendations:
-            recommendations.append("- Серьезных отклонений не обнаружено. Для поддержания здоровой осанки и походки рекомендуется регулярная физическая активность и упражнения на баланс.")
-        
-        # Добавляем рекомендации в отчет
-        summary.extend(recommendations)
+
         
         # Формируем итоговый текст отчета
         summary_text = '\n'.join(summary)
